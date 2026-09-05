@@ -1,0 +1,7 @@
+*.o
+*.dll
+*.exe
+*.log
+saves/
+accounts.dat
+lib/

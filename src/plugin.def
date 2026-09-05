@@ -1,0 +1,5 @@
+EXPORTS
+    dllStartPlugin
+    dllStopPlugin
+    _Z11startPluginv
+    ?startPlugin@@YAXXZ = _Z11startPluginv
