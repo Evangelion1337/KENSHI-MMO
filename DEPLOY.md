@@ -58,7 +58,8 @@ Does **not** need Kenshi installed. On Linux:
 
 ### 2. Client
 
-Copy the mod folder into the vanilla install:
+Grab `KenshiMMO-client.zip` and extract it inside `<Kenshi>/mods/` (it unpacks to a
+`KenshiMMO/` folder on its own):
 
 ```
 <Kenshi>/mods/KenshiMMO/KenshiMMO.dll

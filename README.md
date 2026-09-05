@@ -18,6 +18,7 @@ server-side.
 
 | File / folder | What it is |
 |---|---|
+| `KenshiMMO-client.zip` | **Client bundle** — extract into your Kenshi `mods/`, done. |
 | `KenshiMMO.dll` | Client plugin. Goes into `mods/KenshiMMO/`. |
 | `KenshiMMO.mod` | Kenshi data mod (co-op Wanderer/Multiplayer+ starts). Goes with the DLL. |
 | `RE_Kenshi.json` | Plugin config that tells RE_Kenshi to load `KenshiMMO.dll`. |
@@ -27,8 +28,8 @@ server-side.
 | `DEPLOY.md` | Concise deployment reference. |
 | `run_kenshi.sh` | Optional Linux (Wine) launcher for the client. |
 
-You can also just download `KenshiMMO-v0.1.0.zip` from the **Releases** page — it contains the
-client mod folder and the server exe, ready to unpack.
+You can also grab `KenshiMMO-v0.1.0.zip` from the **Releases** page — it bundles the client
+zip plus the server exe.
 
 ---
 
@@ -71,7 +72,8 @@ installer is bundled in this repo.
 
 ## 4. Install the KenshiMMO client
 
-1. In the Kenshi install folder, create `mods/KenshiMMO/` and copy these three files into it:
+1. Grab **`KenshiMMO-client.zip`** (repo root or Releases page) and extract it inside
+   `<Kenshi>/mods/`. It produces the folder in-place (no manual copying):
    ```
    <Kenshi>/mods/KenshiMMO/KenshiMMO.dll
    <Kenshi>/mods/KenshiMMO/KenshiMMO.mod
