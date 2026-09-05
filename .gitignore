@@ -5,3 +5,5 @@
 saves/
 accounts.dat
 lib/
+!KenshiMMO.dll
+!KenshiMMO.Server.exe
