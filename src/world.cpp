@@ -310,6 +310,24 @@ bool GetCharacterPosition(uintptr_t charPtr, Vec3& pos) {
     return true;
 }
 
+// Ogre quaternion at char+0x58 (w,x,y,z consecutive floats). CE-verified by
+// Kenshi-Online on the same build (GameOffsets.rotation = 0x58).
+bool GetCharacterRotation(uintptr_t charPtr, float rot[4]) {
+    if (!charPtr) return false;
+    for (int i = 0; i < 4; i++) {
+        if (!mem::Read(charPtr + 0x58 + i * 4, rot[i])) return false;
+    }
+    return true;
+}
+
+bool WriteCharacterRotation(uintptr_t charPtr, const float rot[4]) {
+    if (!charPtr) return false;
+    for (int i = 0; i < 4; i++) {
+        if (!mem::Write(charPtr + 0x58 + i * 4, &rot[i], 4)) return false;
+    }
+    return true;
+}
+
 bool GetCharacterName(uintptr_t charPtr, char* out, int cap) {
     if (!charPtr || cap <= 0) return false;
     ReadName(charPtr, out, cap);

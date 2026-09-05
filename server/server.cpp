@@ -32,6 +32,7 @@ CRITICAL_SECTION g_onlineLock;
 struct LiveConn {
     SOCKET s;
     char user[128];
+    char pchar[96];      // character name this session commands (SETPLAYER)
     volatile LONG active;
 };
 LiveConn g_conns[kMaxOnline];
@@ -45,6 +46,8 @@ struct PosRelay {
     char name[128];
     SOCKET src;
     int x, y, z;
+    float w, qx, qy, qz;
+    int hasRot;
     DWORD lastMs;
 };
 PosRelay g_pos[kMaxOnline];
@@ -55,7 +58,8 @@ CRITICAL_SECTION g_posLock;
 volatile DWORD g_clockSec = 0;
 volatile DWORD g_clockLastMs = 0;
 
-void PosStore(const char* name, int x, int y, int z, SOCKET src) {
+void PosStore(const char* name, int x, int y, int z, SOCKET src,
+              const float* rot) {
     EnterCriticalSection(&g_posLock);
     int freeSlot = -1;
     for (int i = 0; i < kMaxOnline; i++) {
@@ -68,6 +72,11 @@ void PosStore(const char* name, int x, int y, int z, SOCKET src) {
             g_pos[i].x = x;
             g_pos[i].y = y;
             g_pos[i].z = z;
+            if (rot) {
+                g_pos[i].w = rot[0]; g_pos[i].qx = rot[1];
+                g_pos[i].qy = rot[2]; g_pos[i].qz = rot[3];
+                g_pos[i].hasRot = 1;
+            }
             g_pos[i].lastMs = GetTickCount();
             LeaveCriticalSection(&g_posLock);
             return;
@@ -79,6 +88,11 @@ void PosStore(const char* name, int x, int y, int z, SOCKET src) {
         g_pos[freeSlot].x = x;
         g_pos[freeSlot].y = y;
         g_pos[freeSlot].z = z;
+        if (rot) {
+            g_pos[freeSlot].w = rot[0]; g_pos[freeSlot].qx = rot[1];
+            g_pos[freeSlot].qy = rot[2]; g_pos[freeSlot].qz = rot[3];
+            g_pos[freeSlot].hasRot = 1;
+        }
         g_pos[freeSlot].lastMs = GetTickCount();
     }
     LeaveCriticalSection(&g_posLock);
@@ -97,8 +111,15 @@ void BroadcastPositions() {
             g_pos[p].name[0] = '\0'; // stale: char gone; recycle slot
             continue;
         }
-        snprintf(line, sizeof(line), "POS %s %d %d %d\r\n",
-                 g_pos[p].name, g_pos[p].x, g_pos[p].y, g_pos[p].z);
+        if (g_pos[p].hasRot) {
+            snprintf(line, sizeof(line),
+                     "POS %s %d %d %d %.3f %.3f %.3f %.3f\r\n",
+                     g_pos[p].name, g_pos[p].x, g_pos[p].y, g_pos[p].z,
+                     g_pos[p].w, g_pos[p].qx, g_pos[p].qy, g_pos[p].qz);
+        } else {
+            snprintf(line, sizeof(line), "POS %s %d %d %d\r\n",
+                     g_pos[p].name, g_pos[p].x, g_pos[p].y, g_pos[p].z);
+        }
         for (int c = 0; c < kMaxOnline; c++) {
             if (g_conns[c].active && g_conns[c].user[0] != '\0') {
                 if (g_conns[c].s == g_pos[p].src) continue; // skip sender
@@ -171,6 +192,38 @@ void ConnSetUser(SOCKET s, const char* user) {
     for (int i = 0; i < kMaxOnline; i++) {
         if (g_conns[i].active && g_conns[i].s == s) {
             strncpy(g_conns[i].user, user, sizeof(g_conns[i].user) - 1);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_connLock);
+}
+
+// Record which in-world character a session commands. Relayed to peers as
+// "PLAYER <user> <char>" so every client can tell whose avatar is whose.
+void ConnSetPlayerChar(SOCKET s, const char* name) {
+    char user[128] = {};
+    const char* pc = name ? name : "";
+    EnterCriticalSection(&g_connLock);
+    for (int i = 0; i < kMaxOnline; i++) {
+        if (g_conns[i].active && g_conns[i].s == s) {
+            strncpy(g_conns[i].pchar, pc, sizeof(g_conns[i].pchar) - 1);
+            strncpy(user, g_conns[i].user, sizeof(user) - 1);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_connLock);
+    if (user[0]) kmmo::srvlog::Info("player %s commands '%s'", user, pc);
+    else kmmo::srvlog::Info("anon socket commands '%s'", pc);
+}
+
+// Copy the account name bound to a live session socket into `out`.
+void ConnUserFetch(SOCKET s, char* out, int cap) {
+    out[0] = '\0';
+    EnterCriticalSection(&g_connLock);
+    for (int i = 0; i < kMaxOnline; i++) {
+        if (g_conns[i].active && g_conns[i].s == s) {
+            strncpy(out, g_conns[i].user, cap - 1);
+            out[cap - 1] = '\0';
             break;
         }
     }
@@ -320,10 +373,10 @@ int SendExact(SOCKET s, const void* buf, size_t len) {
     return 0;
 }
 
-void SplitTokens(char* line, char* toks[8], int& count) {
+void SplitTokens(char* line, char* toks[12], int& count) {
     count = 0;
     char* p = line;
-    while (*p && count < 8) {
+    while (*p && count < 12) {
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '\0') break;
         toks[count++] = p;
@@ -354,7 +407,7 @@ DWORD WINAPI ClientWorker(LPVOID param) {
     while (RecvLine(s, buf, sizeof(buf)) >= 0) {
         if (strlen(buf) == 0) continue;
 
-        char* toks[8];
+        char* toks[12];
         int n = 0;
         SplitTokens(buf, toks, n);
         if (n == 0) continue;
@@ -415,7 +468,7 @@ DWORD WINAPI ClientWorker(LPVOID param) {
             // live position relay for the other clients.
             if (OnlineCheck(toks[1])) {
                 int x = atoi(toks[2]), y = atoi(toks[3]), z = atoi(toks[4]);
-                PosStore(toks[1], x, y, z, s);
+                PosStore(toks[1], x, y, z, s, nullptr);
                 if (kmmo::accounts::SavePos(toks[1], x, y, z)) {
                     kmmo::srvlog::Info("world save for %s: %d %d %d", toks[1], x, y, z);
                     SendResponse(s, "OK", "SAVED");
@@ -462,10 +515,32 @@ DWORD WINAPI ClientWorker(LPVOID param) {
             SendResponse(s, "OK", msg);
         } else if (_stricmp(toks[0], "RPOS") == 0 && n >= 5) {
             // High-frequency live position for an arbitrary in-world character
-            // (keyed by character name, not account). No persistence here; the
-            // per-account checkpoint is SAVE_POS. No reply on purpose.
+            // (keyed by character name, not account). Optional rotation:
+            // "RPOS <name> <x> <y> <z> [<w> <qx> <qy> <qz>]". No persistence,
+            // no reply, sender skipped.
             if (loggedIn) {
-                PosStore(toks[1], atoi(toks[2]), atoi(toks[3]), atoi(toks[4]), s);
+                float rot[4] = { 0, 0, 0, 0 };
+                const float* rptr = nullptr;
+                if (n >= 9) {
+                    rot[0] = (float)atof(toks[5]);
+                    rot[1] = (float)atof(toks[6]);
+                    rot[2] = (float)atof(toks[7]);
+                    rot[3] = (float)atof(toks[8]);
+                    rptr = rot;
+                }
+                PosStore(toks[1], atoi(toks[2]), atoi(toks[3]), atoi(toks[4]), s, rptr);
+            }
+        } else if (_stricmp(toks[0], "SETPLAYER") == 0 && n >= 2) {
+            // Ownership: declare which in-world character this session commands.
+            // No reply (mirrors RPOS); relayed to all other sessions so they can
+            // flag shared/overlapping avatars and apply the right broadcasts.
+            if (loggedIn) {
+                ConnSetPlayerChar(s, toks[1]);
+                char usr[128] = {};
+                ConnUserFetch(s, usr, sizeof(usr));
+                char pl[200];
+                snprintf(pl, sizeof(pl), "PLAYER %s %s\r\n", usr, toks[1]);
+                RelayEvent(pl, s);
             }
         } else if (_stricmp(toks[0], "CEVT") == 0 && n >= 3) {
             // Combat event relay: "<character> <state>" (1=down, 2=dead).

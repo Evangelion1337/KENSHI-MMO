@@ -36,6 +36,10 @@ uintptr_t CharacterListArray(const GameOffsets& o);
 // Read a character's cached world position.
 bool GetCharacterPosition(uintptr_t charPtr, Vec3& pos);
 
+// Read/write the Ogre quaternion at char+0x58 (w,x,y,z floats).
+bool GetCharacterRotation(uintptr_t charPtr, float rot[4]);
+bool WriteCharacterRotation(uintptr_t charPtr, const float rot[4]);
+
 // Read the character's display name ('' on failure).
 bool GetCharacterName(uintptr_t charPtr, char* out, int cap);
 

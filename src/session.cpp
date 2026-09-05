@@ -42,6 +42,8 @@ const int kMaxRemote = 256;
 struct RemotePos {
     char name[128];
     float x, y, z;
+    float w, qx, qy, qz;
+    int hasRot;
     DWORD lastMs;
     int active;
 };
@@ -109,7 +111,7 @@ void RemoteEnsureLock() {
     g_remoteLockInit = true;
 }
 
-void RemoteSet(const char* name, float x, float y, float z) {
+void RemoteSet(const char* name, float x, float y, float z, const float* rot) {
     RemoteEnsureLock();
     EnterCriticalSection(&g_remoteLock);
     int freeSlot = -1;
@@ -119,6 +121,13 @@ void RemoteSet(const char* name, float x, float y, float z) {
                 g_remotes[i].x = x;
                 g_remotes[i].y = y;
                 g_remotes[i].z = z;
+                if (rot) {
+                    g_remotes[i].w = rot[0];
+                    g_remotes[i].qx = rot[1];
+                    g_remotes[i].qy = rot[2];
+                    g_remotes[i].qz = rot[3];
+                    g_remotes[i].hasRot = 1;
+                }
                 g_remotes[i].lastMs = GetTickCount();
                 LeaveCriticalSection(&g_remoteLock);
                 return;
@@ -133,6 +142,13 @@ void RemoteSet(const char* name, float x, float y, float z) {
         r.x = x;
         r.y = y;
         r.z = z;
+        if (rot) {
+            r.w = rot[0];
+            r.qx = rot[1];
+            r.qy = rot[2];
+            r.qz = rot[3];
+            r.hasRot = 1;
+        }
         r.lastMs = GetTickCount();
         r.active = 1;
     }
@@ -148,18 +164,63 @@ void ApplyRemotePositions(const char* ownName) {
     RemoteEnsureLock();
     EnterCriticalSection(&g_remoteLock);
     const DWORD now = GetTickCount();
+    static DWORD s_moved = 0, s_absent = 0, s_own = 0, s_moveFail = 0, s_last = 0;
+    static bool s_loggedSamples = false;
+    static char s_absentSample[4][128] = {};
+    static int s_absentSampleN = 0;
     for (int i = 0; i < kMaxRemote; i++) {
         if (!g_remotes[i].active) continue;
         if (now - g_remotes[i].lastMs > 20000) continue;
-        if (ownName[0] && _stricmp(g_remotes[i].name, ownName) == 0) continue;
+        if (ownName[0] && _stricmp(g_remotes[i].name, ownName) == 0) {
+            s_own++;
+            continue;
+        }
         uintptr_t ch = 0;
         if (game::FindCharacterByName(world, g_remotes[i].name, ch)) {
             Vec3 p = { g_remotes[i].x, g_remotes[i].y, g_remotes[i].z };
+            // Interpolate toward the target (~35% per tick) so remote avatars
+            // glide instead of popping; far jumps are applied outright.
+            Vec3 cur = {};
+            if (game::GetCharacterPosition(ch, cur)) {
+                float dist = std::fabsf(cur.x - p.x) + std::fabsf(cur.y - p.y) +
+                             std::fabsf(cur.z - p.z);
+                if (dist < 120.0f) {
+                    p.x = cur.x + (p.x - cur.x) * 0.35f;
+                    p.y = cur.y + (p.y - cur.y) * 0.35f;
+                    p.z = cur.z + (p.z - cur.z) * 0.35f;
+                }
+            }
             if (game::WriteCharacterPosition(ch, p)) {
-                log::Info("session: moved remote '%s' to (%.0f %.0f %.0f)",
-                          g_remotes[i].name, p.x, p.y, p.z);
+                s_moved++;
+                if (g_remotes[i].hasRot) {
+                    float rot[4] = { g_remotes[i].w, g_remotes[i].qx,
+                                     g_remotes[i].qy, g_remotes[i].qz };
+                    game::WriteCharacterRotation(ch, rot);
+                }
+            } else {
+                s_moveFail++;
+            }
+        } else {
+            s_absent++;
+            if (s_absentSampleN < 4) {
+                strncpy(s_absentSample[s_absentSampleN], g_remotes[i].name,
+                        sizeof(s_absentSample[0]) - 1);
+                s_absentSampleN++;
             }
         }
+    }
+    if (now - s_last >= 5000) {
+        log::Info("session: remote-apply totals  moved=%lu absent=%lu own-skipped=%lu write-fail=%lu",
+                  (unsigned long)s_moved, (unsigned long)s_absent,
+                  (unsigned long)s_own, (unsigned long)s_moveFail);
+        if (!s_loggedSamples && s_absentSampleN > 0) {
+            s_loggedSamples = true;
+            for (int k = 0; k < s_absentSampleN; k++) {
+                log::Info("session: absent char sample: '%s' (not in local pool)",
+                          s_absentSample[k]);
+            }
+        }
+        s_last = now;
     }
     LeaveCriticalSection(&g_remoteLock);
 }
@@ -246,8 +307,16 @@ int BroadcastWorldPositions(net::Session* s) {
             continue;
         }
         char rp[200];
-        snprintf(rp, sizeof(rp), "RPOS %s %d %d %d\r\n",
-                 nm, (int)cur.x, (int)cur.y, (int)cur.z);
+        float rot[4] = { 0, 0, 0, 0 };
+        bool hasRot = game::GetCharacterRotation(ch, rot);
+        if (hasRot) {
+            snprintf(rp, sizeof(rp), "RPOS %s %d %d %d %.3f %.3f %.3f %.3f\r\n",
+                     nm, (int)cur.x, (int)cur.y, (int)cur.z,
+                     rot[0], rot[1], rot[2], rot[3]);
+        } else {
+            snprintf(rp, sizeof(rp), "RPOS %s %d %d %d\r\n",
+                     nm, (int)cur.x, (int)cur.y, (int)cur.z);
+        }
         if (net::SessionSendLine(s, rp, 5000) == net::Result::Ok) {
             g_cachePos[i] = cur;
             g_cacheSentMs[i] = now;
@@ -557,6 +626,7 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
     // there is no timeout-driven disconnect during character creation.
     uintptr_t charPtr = 0;
     char charName[96] = {};
+    char announcedChar[96] = {};
     bool live = false;
     bool spawnApplied = false;
     unsigned long polls = 0;
@@ -651,12 +721,15 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
             continue;
         }
         if (line.result == net::Result::Ok && strncmp(line.line, "POS ", 4) == 0) {
-            // Position relay: "<user> x y z" tracking a remote player.
+            // Position relay: "<user> x y z [w qx qy qz]" tracking a remote
+            // player. Rotation tokens are optional (older relays omit them).
             float px = 0, py = 0, pz = 0;
+            float rot[4] = { 0, 0, 0, 0 };
             char rn[128] = {};
-            if (sscanf(line.line + 4, "%127s %f %f %f", rn, &px, &py, &pz) >= 4) {
-                RemoteSet(rn, px, py, pz);
-                log::Info("session: remote '%s' @ (%.0f %.0f %.0f)", rn, px, py, pz);
+            int ntok = sscanf(line.line + 4, "%127s %f %f %f %f %f %f %f",
+                              rn, &px, &py, &pz, &rot[0], &rot[1], &rot[2], &rot[3]);
+            if (ntok >= 4) {
+                RemoteSet(rn, px, py, pz, ntok >= 8 ? rot : nullptr);
             }
             continue;
         }
@@ -680,6 +753,22 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
                 } else {
                     log::Info("session: remote combat '%s' but no such local character",
                               cn);
+                }
+            }
+            continue;
+        }
+        if (line.result == net::Result::Ok && strncmp(line.line, "PLAYER ", 7) == 0) {
+            // Ownership roster: "<user> <char>" says which in-world character a
+            // peer commands. Log + flag overlap with our own character so the
+            // shared-avatar case (both players on the same save) is visible.
+            char pu[128] = {}, pc[96] = {};
+            if (sscanf(line.line + 7, "%127s %95s", pu, pc) >= 2) {
+                log::Info("session: peer '%s' commands '%s'", pu, pc);
+                if (charName[0] && _stricmp(pc, charName) == 0) {
+                    log::Warn("session: CHARACTER SHARED — '%s' is also our "
+                              "character; both players command the same avatar",
+                              pc);
+                    SetStatus("CHAR '%s' is shared with peer %s!", pc, pu);
                 }
             }
             continue;
@@ -825,6 +914,18 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
                         g_clockSec = c;
                         log::Info("session: clock query -> %lu", (unsigned long)c);
                     }
+                }
+            }
+
+            // Announce which character this session commands, once per change.
+            // Peers receive "PLAYER <user> <char>" and use it to spot shared
+            // avatars (two players commanding the same character).
+            if (charName[0] && strcmp(charName, announcedChar) != 0) {
+                strncpy(announcedChar, charName, sizeof(announcedChar) - 1);
+                char spCmd[128];
+                snprintf(spCmd, sizeof(spCmd), "SETPLAYER %s\r\n", charName);
+                if (net::SessionSendLine(s, spCmd, 5000) == net::Result::Ok) {
+                    log::Info("session: announced owned character '%s'", charName);
                 }
             }
             continue;
