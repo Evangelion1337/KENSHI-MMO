@@ -17,6 +17,10 @@ src/                     Client plugin sources (dll)
 server/                  Server sources (exe)
 KenshiMMO.dll            Prebuilt client plugin  (md5 e6fff526d050ec3e4eee6744aca5ce9f)
 KenshiMMO.Server.exe     Prebuilt server
+KenshiMMO.mod            Kenshi data mod (co-op Wanderer/Multiplayer starts, template clones)
+RE_Kenshi.json           Plugin-loader config -> registers "KenshiMMO.dll" with RE_Kenshi
+KenshiMMO.dll.bak-*      Prior plugin builds (debugging only)
+third-party/RE_Kenshi/   RE_Kenshi v0.3.5 installer (GPL-3.0, by BFrizzleFoShizzle)
 ```
 
 ## Build (requires mingw-w64)
@@ -25,6 +29,15 @@ KenshiMMO.Server.exe     Prebuilt server
 make            # needs x86_64-w64-mingw32-g++
 make clean
 ```
+
+## Dependencies
+
+- **Kenshi** (licensed copy, Steam or GOG, 1.0.65 / 1.0.68).
+- **RE_Kenshi** is required by the client: it provides the plugin loader that
+  injects `KenshiMMO.dll`. The installer is bundled under `third-party/RE_Kenshi/`
+  (free, GPL-3.0). Run it against your Kenshi install. Upstream:
+  https://github.com/BFrizzleFoShizzle/RE_Kenshi
+- A **server** (see below) — the user can host their own or join yours.
 
 ## Deploy
 
@@ -45,15 +58,18 @@ Does **not** need Kenshi installed. On Linux:
 
 ### 2. Client
 
-Copy the plugin into the vanilla install:
+Copy the mod folder into the vanilla install:
 
 ```
 <Kenshi>/mods/KenshiMMO/KenshiMMO.dll
+<Kenshi>/mods/KenshiMMO/KenshiMMO.mod
+<Kenshi>/mods/KenshiMMO/RE_Kenshi.json
 ```
 
-Then launch Kenshi with the `KenshiMMO` mod enabled. The plugin shows an
-in-game login panel (`REGISTER <user> <pass>` for new accounts, `LOGIN` for
-existing). First login uploads your local save as the world state.
+Then load **RE_Kenshi** (its settings menu lists `KenshiMMO.dll` as a plugin).
+The plugin shows an in-game login panel (`REGISTER <user> <pass>` for new
+accounts, `LOGIN` for existing). First login uploads your local save as the
+world state.
 
 ### 3. Server address
 
@@ -64,12 +80,15 @@ the port is `KMMO_SERVER_PORT`.
 ## Linux client layout (Wine example)
 
 ```
-~/.wine/drive_c/Kenshi/
+~/.../Kenshi/
 ├── Kenshi.exe
 ├── data/                      # vanilla assets (not in this repo)
+├── Plugins_x64.cfg            # edited by the RE_Kenshi installer
 ├── mods/
 │   └── KenshiMMO/
-│       └── KenshiMMO.dll
+│       ├── KenshiMMO.dll
+│       ├── KenshiMMO.mod
+│       └── RE_Kenshi.json
 └── KenshiMMO.log              # client log, written next to the exe
 ```
 

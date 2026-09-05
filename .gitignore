@@ -7,3 +7,4 @@ accounts.dat
 lib/
 !KenshiMMO.dll
 !KenshiMMO.Server.exe
+!third-party/RE_Kenshi/RE_Kenshi_v0.3.5.exe
