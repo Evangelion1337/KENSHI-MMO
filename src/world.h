@@ -20,6 +20,9 @@ uintptr_t GetGameWorld(const Discovery& d);
 // Writes found ptr to outPtr. Returns true if found.
 bool FindFirstCharacter(uintptr_t world, uintptr_t& outPtr);
 
+// Find any loaded character whose name matches (track remote players).
+bool FindCharacterByName(uintptr_t world, const char* name, uintptr_t& outPtr);
+
 // Set an additional player-name to accept beyond the default "Nameless_0"
 // (used when the server tells us which squad this account owns).
 void SetPreferredPlayerName(const char* name);
@@ -42,6 +45,12 @@ bool WriteCharacterPosition(uintptr_t charPtr, const Vec3& pos);
 
 // Enumerate characters from the live world; returns count scanned.
 int CountCharacters(uintptr_t world);
+
+// Fill `out` (up to `cap`) with live character pointers from the character
+// pool, ordered by pool slot. Returns the number filled. Used by the session
+// to broadcast the whole visible world (shared world startup: both clients
+// load the same save, so every character exists on both sides).
+int ListCharacters(uintptr_t world, uintptr_t* out, int cap);
 
 } // namespace game
 } // namespace kmmo

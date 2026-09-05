@@ -37,6 +37,106 @@ struct LiveConn {
 LiveConn g_conns[kMaxOnline];
 CRITICAL_SECTION g_connLock;
 
+// Position relay: the newest reported world position per in-world character,
+// pushed to every OTHER live session so clients can move remote characters.
+// Keyed by character name (not account); the source socket lets us skip the
+// sender so a client never re-applies its own positions.
+struct PosRelay {
+    char name[128];
+    SOCKET src;
+    int x, y, z;
+    DWORD lastMs;
+};
+PosRelay g_pos[kMaxOnline];
+CRITICAL_SECTION g_posLock;
+
+// Shared world clock (seconds since the authority's in-game day start). Clients
+// that read their in-game time report it; the server echoes it to everyone.
+volatile DWORD g_clockSec = 0;
+volatile DWORD g_clockLastMs = 0;
+
+void PosStore(const char* name, int x, int y, int z, SOCKET src) {
+    EnterCriticalSection(&g_posLock);
+    int freeSlot = -1;
+    for (int i = 0; i < kMaxOnline; i++) {
+        if (g_pos[i].name[0] == '\0') {
+            if (freeSlot < 0) freeSlot = i;
+            continue;
+        }
+        if (_stricmp(g_pos[i].name, name) == 0) {
+            g_pos[i].src = src;
+            g_pos[i].x = x;
+            g_pos[i].y = y;
+            g_pos[i].z = z;
+            g_pos[i].lastMs = GetTickCount();
+            LeaveCriticalSection(&g_posLock);
+            return;
+        }
+    }
+    if (freeSlot >= 0) {
+        strncpy(g_pos[freeSlot].name, name, sizeof(g_pos[freeSlot].name) - 1);
+        g_pos[freeSlot].src = src;
+        g_pos[freeSlot].x = x;
+        g_pos[freeSlot].y = y;
+        g_pos[freeSlot].z = z;
+        g_pos[freeSlot].lastMs = GetTickCount();
+    }
+    LeaveCriticalSection(&g_posLock);
+}
+
+// Broadcast the current position of every recently-seen character to all other
+// live sessions. Stale entries are dropped so slots recycle.
+void BroadcastPositions() {
+    EnterCriticalSection(&g_posLock);
+    EnterCriticalSection(&g_connLock);
+    const DWORD now = GetTickCount();
+    char line[256];
+    for (int p = 0; p < kMaxOnline; p++) {
+        if (g_pos[p].name[0] == '\0') continue;
+        if (now - g_pos[p].lastMs > 20000) {
+            g_pos[p].name[0] = '\0'; // stale: char gone; recycle slot
+            continue;
+        }
+        snprintf(line, sizeof(line), "POS %s %d %d %d\r\n",
+                 g_pos[p].name, g_pos[p].x, g_pos[p].y, g_pos[p].z);
+        for (int c = 0; c < kMaxOnline; c++) {
+            if (g_conns[c].active && g_conns[c].user[0] != '\0') {
+                if (g_conns[c].s == g_pos[p].src) continue; // skip sender
+                if (send(g_conns[c].s, line, (int)strlen(line), 0) <= 0) {
+                    g_conns[c].active = 0; // dead socket; drop
+                }
+            }
+        }
+    }
+    LeaveCriticalSection(&g_connLock);
+    LeaveCriticalSection(&g_posLock);
+}
+
+void BroadcastClock() {
+    DWORD last = g_clockLastMs;
+    if (!last) return;
+    char line[64];
+    snprintf(line, sizeof(line), "CLOCK %lu\r\n", (unsigned long)g_clockSec);
+    EnterCriticalSection(&g_connLock);
+    for (int c = 0; c < kMaxOnline; c++) {
+        if (g_conns[c].active && g_conns[c].user[0] != '\0') {
+            if (send(g_conns[c].s, line, (int)strlen(line), 0) <= 0) {
+                g_conns[c].active = 0;
+            }
+        }
+    }
+    LeaveCriticalSection(&g_connLock);
+}
+
+DWORD WINAPI RelayLoop(LPVOID) {
+    for (;;) {
+        Sleep(1000);
+        BroadcastPositions();
+        BroadcastClock();
+    }
+    return 0;
+}
+
 void ConnRegister(SOCKET s) {
     EnterCriticalSection(&g_connLock);
     for (int i = 0; i < kMaxOnline; i++) {
@@ -233,7 +333,7 @@ DWORD WINAPI ClientWorker(LPVOID param) {
 
     bool loggedIn = false;
     (void)loggedIn;
-    SendResponse(s, "OK", "KenshiMMO server v0.1. Type REGISTER <user> <pass> or LOGIN <user> <pass>");
+    SendResponse(s, "OK", "KenshiMMO server v0.2 (shared world). Type REGISTER <user> <pass> or LOGIN <user> <pass>");
 
     while (RecvLine(s, buf, sizeof(buf)) >= 0) {
         if (strlen(buf) == 0) continue;
@@ -295,9 +395,11 @@ DWORD WINAPI ClientWorker(LPVOID param) {
             }
         } else if (_stricmp(toks[0], "SAVE_POS") == 0 && n >= 5) {
             // Client persists the character's world position back to the
-            // server-side save (the only save that counts).
+            // server-side save (the only save that counts) and feeds the
+            // live position relay for the other clients.
             if (OnlineCheck(toks[1])) {
                 int x = atoi(toks[2]), y = atoi(toks[3]), z = atoi(toks[4]);
+                PosStore(toks[1], x, y, z, s);
                 if (kmmo::accounts::SavePos(toks[1], x, y, z)) {
                     kmmo::srvlog::Info("world save for %s: %d %d %d", toks[1], x, y, z);
                     SendResponse(s, "OK", "SAVED");
@@ -307,8 +409,52 @@ DWORD WINAPI ClientWorker(LPVOID param) {
             } else {
                 SendResponse(s, "ERR", "NOT_LOGGED_IN");
             }
+        } else if (_stricmp(toks[0], "WHO") == 0) {
+            // List the online roster (users logged in within the grace window).
+            char msg[512] = "ONLINE 0";
+            const DWORD now = GetTickCount();
+            EnterCriticalSection(&g_onlineLock);
+            int used = 0;
+            for (int i = 0; i < kMaxOnline; i++) {
+                if (g_online[i].name[0] == '\0') continue;
+                if (now - g_online[i].lastLoginMs >= 900000) {
+                    g_online[i].name[0] = '\0'; // stale
+                    continue;
+                }
+                used++;
+            }
+            snprintf(msg, sizeof(msg), "ONLINE %d", used);
+            int names = 0;
+            size_t off = strlen(msg);
+            for (int i = 0; i < kMaxOnline; i++) {
+                if (g_online[i].name[0] == '\0') continue;
+                if (now - g_online[i].lastLoginMs >= 900000) continue;
+                if (names++ >= 24 || off >= sizeof(msg) - 96) break;
+                snprintf(msg + off, sizeof(msg) - off, " %s", g_online[i].name);
+                off = strlen(msg);
+            }
+            LeaveCriticalSection(&g_onlineLock);
+            SendResponse(s, "OK", msg);
+        } else if (_stricmp(toks[0], "TIME") == 0 && n >= 2) {
+            // Client reports the authoritative world clock (seconds).
+            g_clockSec = (DWORD)strtoul(toks[1], nullptr, 10);
+            g_clockLastMs = GetTickCount();
+            SendResponse(s, "OK", "CLOCK_SET");
+        } else if (_stricmp(toks[0], "TIME?") == 0) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "CLOCK %lu", (unsigned long)g_clockSec);
+            SendResponse(s, "OK", msg);
+        } else if (_stricmp(toks[0], "RPOS") == 0 && n >= 5) {
+            // High-frequency live position for an arbitrary in-world character
+            // (keyed by character name, not account). No persistence here; the
+            // per-account checkpoint is SAVE_POS. No reply on purpose.
+            if (loggedIn) {
+                PosStore(toks[1], atoi(toks[2]), atoi(toks[3]), atoi(toks[4]), s);
+            }
         } else if (_stricmp(toks[0], "SAVE_UPLOAD_BEGIN") == 0 && n >= 2) {
-            if (kmmo::accounts::WriteSaveBegin(toks[1])) {
+            // World blob upload open: resets the shared authority world blob.
+            if (loggedIn && kmmo::accounts::WriteSaveBegin(
+                    kmmo::accounts::SharedBlobUser())) {
                 SendResponse(s, "OK", "READY");
             } else {
                 SendResponse(s, "ERR", "OPEN_FAILED");
@@ -324,7 +470,8 @@ DWORD WINAPI ClientWorker(LPVOID param) {
             if (RecvExact(s, g_chunkBuf, (size_t)len) != (int)len) {
                 return 0;
             }
-            long long wrote = kmmo::accounts::WriteSave(toks[1], off, g_chunkBuf, len);
+            long long wrote = kmmo::accounts::WriteSave(
+                kmmo::accounts::SharedBlobUser(), off, g_chunkBuf, len);
             if (wrote == len) {
                 SendResponse(s, "OK", "CHUNK");
             } else {
@@ -332,12 +479,13 @@ DWORD WINAPI ClientWorker(LPVOID param) {
             }
         } else if (_stricmp(toks[0], "SAVE_UPLOAD_END") == 0 && n >= 3) {
             long long size = _strtoi64(toks[2], nullptr, 10);
-            kmmo::accounts::WriteSaveEnd(toks[1], size);
+            kmmo::accounts::WriteSaveEnd(kmmo::accounts::SharedBlobUser(), size);
             SendResponse(s, "OK", "SAVED");
-            kmmo::srvlog::Info("save blob received for %s (%lld bytes)", toks[1], size);
+            kmmo::srvlog::Info("world blob received (%lld bytes)", size);
         } else if (_stricmp(toks[0], "SAVE_INFO") == 0 && n >= 2) {
             int64_t size = 0;
-            if (kmmo::accounts::GetSaveSize(toks[1], size)) {
+            if (kmmo::accounts::GetSaveSize(
+                    kmmo::accounts::SharedBlobUser(), size)) {
                 char msg[64];
                 snprintf(msg, sizeof(msg), "SAVESIZE %lld", (long long)size);
                 SendResponse(s, "OK", msg);
@@ -346,7 +494,8 @@ DWORD WINAPI ClientWorker(LPVOID param) {
             }
         } else if (_stricmp(toks[0], "SAVE_DOWNLOAD_BEGIN") == 0 && n >= 2) {
             int64_t size = 0;
-            if (kmmo::accounts::GetSaveSize(toks[1], size)) {
+            if (kmmo::accounts::GetSaveSize(
+                    kmmo::accounts::SharedBlobUser(), size)) {
                 char msg[128];
                 snprintf(msg, sizeof(msg), "READY %lld", (long long)size);
                 SendResponse(s, "OK", msg);
@@ -354,14 +503,15 @@ DWORD WINAPI ClientWorker(LPVOID param) {
                 SendResponse(s, "ERR", "NOSAVE");
             }
         } else if (_stricmp(toks[0], "SAVE_DOWNLOAD") == 0 && n >= 4) {
-            // SAVE_DOWNLOAD <user> <off> <len> -> OK CHUNK\n then raw bytes.
+            // SAVE_DOWNLOAD <off> <len> -> OK CHUNK\n then raw bytes.
             long long off = _strtoi64(toks[2], nullptr, 10);
             long long len = _strtoi64(toks[3], nullptr, 10);
             if (len < 0 || len > kMaxChunk) {
                 SendResponse(s, "ERR", "BAD_LEN");
                 break;
             }
-            long long got = kmmo::accounts::ReadSave(toks[1], off, g_chunkBuf, len);
+            long long got = kmmo::accounts::ReadSave(
+                kmmo::accounts::SharedBlobUser(), off, g_chunkBuf, len);
             if (got < 0) {
                 SendResponse(s, "ERR", "READ_FAILED");
                 break;
@@ -372,14 +522,15 @@ DWORD WINAPI ClientWorker(LPVOID param) {
             SendExact(s, g_chunkBuf, (size_t)got);
         } else if (_stricmp(toks[0], "SAVE_DOWNLOAD_END") == 0) {
             SendResponse(s, "OK", "DONE");
-        } else if (_stricmp(toks[0], "SAVE_CLEAR") == 0 && n >= 2) {
-            kmmo::accounts::ClearSave(toks[1]);
+        } else if (_stricmp(toks[0], "SAVE_CLEAR") == 0) {
+            kmmo::accounts::ClearSave(kmmo::accounts::SharedBlobUser());
             SendResponse(s, "OK", "CLEARED");
         } else if (_stricmp(toks[0], "RESUME") == 0 && n >= 2) {
             // Reattach an existing session after a drop: no password check
             // (the socket is already post-login), just register the user so
             // it keeps receiving QUICKSAVE broadcasts.
             if (kmmo::accounts::HasUser(toks[1])) {
+                loggedIn = true;
                 OnlineMark(toks[1]);
                 ConnSetUser(s, toks[1]);
                 kmmo::srvlog::Info("session resumed for %s (%s)", toks[1], peer);
@@ -450,9 +601,11 @@ int main() {
 
     InitializeCriticalSection(&g_onlineLock);
     InitializeCriticalSection(&g_connLock);
+    InitializeCriticalSection(&g_posLock);
 
     int loaded = kmmo::accounts::Load("accounts.dat");
     kmmo::srvlog::Info("loaded %d accounts", loaded);
+    kmmo::accounts::SeedSharedBlobIfMissing("saves");
 
     WSADATA wsa = {};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -463,6 +616,11 @@ int main() {
     HANDLE h = CreateThread(nullptr, 0, AcceptLoop, nullptr, 0, nullptr);
     if (!h) {
         kmmo::srvlog::Info("failed to start accept thread");
+        return 1;
+    }
+    HANDLE hr = CreateThread(nullptr, 0, RelayLoop, nullptr, 0, nullptr);
+    if (!hr) {
+        kmmo::srvlog::Info("failed to start relay thread");
         return 1;
     }
 

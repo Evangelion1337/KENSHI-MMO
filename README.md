@@ -1,9 +1,10 @@
 # KenshiMMO
 
 Turn Kenshi into a small online world. Friends log into the **same server**, share the
-**same world**, and take over each other's save state instead of keeping separate single-player
-runs. The server is authoritative: accounts, the shared world, and per-player save blobs all live
-server-side.
+**same world**, and take over an authoritative server-side save instead of keeping separate
+single-player runs. The world itself is a **single shared save** on the server; every client
+loads that same save, and in-game characters are broadcast live to each other so co-op
+partners (and their whole squad) appear and move in real time.
 
 - Client: `KenshiMMO.dll` plugin, injected by RE_Kenshi.
 - Server: `KenshiMMO.Server.exe` — runs headless, needs **no** Kenshi install.
@@ -28,7 +29,7 @@ server-side.
 | `DEPLOY.md` | Concise deployment reference. |
 | `run_kenshi.sh` | Optional Linux (Wine) launcher for the client. |
 
-You can also grab `KenshiMMO-v0.1.0.zip` from the **Releases** page — it bundles the client
+You can also grab `KenshiMMO-v0.2.0.zip` from the **Releases** page — it bundles the client
 zip plus the server exe.
 
 ---
@@ -109,7 +110,7 @@ wine64 KenshiMMO.Server.exe
 First line you see should be:
 
 ```
-OK KenshiMMO server v0.1. Type REGISTER <user> <pass> or LOGIN <user> <pass>
+OK KenshiMMO server v0.2 (shared world). Type REGISTER <user> <pass> or LOGIN <user> <pass>
 ```
 
 - Leave it running in a terminal (or under `nohup`/systemd).
@@ -127,10 +128,12 @@ In the KenshiMMO panel inside the game:
    - Registration creates the account and immediately logs you in.
 3. **Returning**: hit **LOGIN**.
 4. On your **first login ever**, the client uploads your current local save — that becomes the
-   shared world for that account. From then on the server is the source of truth; don't reuse the
-   local save.
-5. You spawn as your co-op Wanderer squad and everyone else on the server exists in the same
-   world as you play.
+   **shared world** for the whole server (seed). From then on the server is the only source of
+   truth; every account downloads the same world blob on join.
+5. You spawn as your co-op Wanderer squad. Because everyone shares one world, other players'
+   characters already exist in it — the client broadcasts live positions of every character in
+   the visible zone (`RPOS`), and each client snaps those characters into place locally, so co-op
+   partners move in real time.
 
 > The credentials are the same account system used by the server: `accounts.dat` stores
 > username, random salt, and the salted SHA-256 of the password.

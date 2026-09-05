@@ -243,6 +243,64 @@ bool FindFirstCharacter(uintptr_t world, uintptr_t& outPtr) {
     return false;
 }
 
+bool FindCharacterByName(uintptr_t world, const char* name, uintptr_t& outPtr) {
+    if (!world || !name || !name[0]) return false;
+    const GameOffsets& o = Discovery::Get().Result();
+    if (!o.base) return false;
+    uintptr_t modEnd = o.base + 0x232D000;
+
+    uintptr_t arr = FindCharacterPoolArray();
+    if (!arr) return false;
+
+    for (int emptyRun = 0, i = 0; i < kMaxChars; i++) {
+        uintptr_t c = 0;
+        if (!mem::Read(arr + (size_t)i * 8, c) || c == 0) { emptyRun++; continue; }
+        if (!IsHeapLike(c, o.base, modEnd)) { emptyRun++; continue; }
+        uintptr_t vt = 0;
+        if (!mem::Read(c, vt) || vt != o.base + kCharVtableRva) {
+            if (++emptyRun >= kSentinelRunStop) break;
+            continue;
+        }
+        emptyRun = 0;
+        char nm[96] = {};
+        ReadName(c, nm, sizeof(nm));
+        if (!IsPrintableName(nm)) continue;
+        if (_stricmp(nm, name) == 0) {
+            outPtr = c;
+            return true;
+        }
+    }
+    return false;
+}
+
+int ListCharacters(uintptr_t world, uintptr_t* out, int cap) {
+    if (!world || !out || cap <= 0) return 0;
+    const GameOffsets& o = Discovery::Get().Result();
+    if (!o.base) return 0;
+    uintptr_t modEnd = o.base + 0x232D000;
+
+    uintptr_t arr = FindCharacterPoolArray();
+    if (!arr) return 0;
+
+    int written = 0;
+    for (int emptyRun = 0, i = 0; i < kMaxChars && written < cap; i++) {
+        uintptr_t c = 0;
+        if (!mem::Read(arr + (size_t)i * 8, c) || c == 0) { emptyRun++; continue; }
+        if (!IsHeapLike(c, o.base, modEnd)) { emptyRun++; continue; }
+        uintptr_t vt = 0;
+        if (!mem::Read(c, vt) || vt != o.base + kCharVtableRva) {
+            if (++emptyRun >= kSentinelRunStop) break;
+            continue;
+        }
+        emptyRun = 0;
+        char nm[96] = {};
+        ReadName(c, nm, sizeof(nm));
+        if (!IsPrintableName(nm) || !nm[0]) continue;
+        out[written++] = c;
+    }
+    return written;
+}
+
 bool GetCharacterPosition(uintptr_t charPtr, Vec3& pos) {
     pos = { 0, 0, 0 };
     if (!charPtr) return false;

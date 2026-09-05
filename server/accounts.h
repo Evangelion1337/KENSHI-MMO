@@ -73,6 +73,15 @@ void WriteSaveEnd(const char* user, int64_t size);
 // Wipe the stored save blob for a user.
 void ClearSave(const char* user);
 
+// The blob key for the single shared authority world. All clients download and
+// upload through this key so everyone plays the SAME world (co-op visibility).
+// Login/registration stay per-account; only the world blob is shared.
+const char* SharedBlobUser();
+
+// If no shared world blob exists yet, seed it from the largest legacy
+// per-account blob so an existing world becomes the authority world.
+void SeedSharedBlobIfMissing(const char* baseDir);
+
 // ---- Squad ownership ----
 
 // Remember which in-world squad this account controls. Returns false if the

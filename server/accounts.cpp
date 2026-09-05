@@ -186,6 +186,75 @@ void ClearSave(const char* user) {
     DeleteFileA(path);
 }
 
+const char* SharedBlobUser() {
+    return "shared";
+}
+
+void SeedSharedBlobIfMissing(const char* baseDir) {
+    char sharedPath[MAX_PATH];
+    BlobFileFor(SharedBlobUser(), sharedPath, sizeof(sharedPath));
+    FILE* fp = fopen(sharedPath, "rb");
+    if (fp) {
+        fclose(fp);
+        return; // shared blob already exists
+    }
+
+    // Adopt the largest legacy per-account blob as the authority world.
+    char bestPath[MAX_PATH] = {};
+    long bestSize = 0;
+    char pattern[MAX_PATH];
+    snprintf(pattern, sizeof(pattern), "%s\\*", baseDir);
+    WIN32_FIND_DATAA fd = {};
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        srvlog::Info("shared blob: no saves dir '%s' to seed from", baseDir);
+        return;
+    }
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        if (_stricmp(fd.cFileName, SharedBlobUser()) == 0) continue;
+        char blob[MAX_PATH];
+        snprintf(blob, sizeof(blob), "%s\\%s\\save.blob", baseDir, fd.cFileName);
+        FILE* b = fopen(blob, "rb");
+        if (!b) continue;
+        if (fseek(b, 0, SEEK_END) != 0) { fclose(b); continue; }
+        long sz = ftell(b);
+        fclose(b);
+        if (sz > bestSize) {
+            bestSize = sz;
+            snprintf(bestPath, sizeof(bestPath), "%s", blob);
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+
+    if (bestSize <= 0 || !bestPath[0]) {
+        srvlog::Info("shared blob: no legacy save found to seed");
+        return;
+    }
+
+    if (!WriteSaveBegin(SharedBlobUser())) {
+        srvlog::Info("shared blob: could not create shared save");
+        return;
+    }
+    FILE* src = fopen(bestPath, "rb");
+    if (!src) return;
+    char buf[65536];
+    long long off = 0;
+    while (off < bestSize) {
+        size_t want = (size_t)(bestSize - off);
+        if (want > sizeof(buf)) want = sizeof(buf);
+        size_t got = fread(buf, 1, want, src);
+        if (got == 0) break;
+        WriteSave(SharedBlobUser(), off, buf, (int64_t)got);
+        off += (int64_t)got;
+    }
+    fclose(src);
+    WriteSaveEnd(SharedBlobUser(), off);
+    srvlog::Info("shared blob: seeded from %s (%lld bytes)",
+                 bestPath, (long long)off);
+}
+
 int Load(const char* path) {
     EnsureLock();
     EnterCriticalSection(&g_lock);

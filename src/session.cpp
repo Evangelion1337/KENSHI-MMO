@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 
 namespace kmmo {
 namespace session {
@@ -31,6 +32,190 @@ struct Session {
 
 Session g_s;
 bool g_lockInit = false;
+
+// Remote-character registry: positions the server relays from other clients.
+// Each tick the worker moves the matching character (if present in this
+// world) to the reported position so co-op partners become visible. Both
+// clients load the SAME shared world save, so every character exists in both
+// worlds and the whole world can be synced by name.
+const int kMaxRemote = 256;
+struct RemotePos {
+    char name[128];
+    float x, y, z;
+    DWORD lastMs;
+    int active;
+};
+RemotePos g_remotes[kMaxRemote];
+CRITICAL_SECTION g_remoteLock;
+bool g_remoteLockInit = false;
+
+// Cached view of the live character pool for whole-world broadcast.
+const int kMaxCache = 1024;
+uintptr_t g_cache[kMaxCache];
+Vec3 g_cachePos[kMaxCache];
+DWORD g_cacheSentMs[kMaxCache];
+int g_cacheCount = 0;
+
+// Latest server time-of-day (seconds) and online roster for the status line.
+volatile DWORD g_clockSec = 0;
+char g_onlineNames[512] = {};
+int g_onlineCount = 0;
+
+void RemoteEnsureLock() {
+    if (g_remoteLockInit) return;
+    InitializeCriticalSection(&g_remoteLock);
+    g_remoteLockInit = true;
+}
+
+void RemoteSet(const char* name, float x, float y, float z) {
+    RemoteEnsureLock();
+    EnterCriticalSection(&g_remoteLock);
+    int freeSlot = -1;
+    for (int i = 0; i < kMaxRemote; i++) {
+        if (g_remotes[i].active) {
+            if (_stricmp(g_remotes[i].name, name) == 0) {
+                g_remotes[i].x = x;
+                g_remotes[i].y = y;
+                g_remotes[i].z = z;
+                g_remotes[i].lastMs = GetTickCount();
+                LeaveCriticalSection(&g_remoteLock);
+                return;
+            }
+            continue;
+        }
+        if (freeSlot < 0) freeSlot = i;
+    }
+    if (freeSlot >= 0) {
+        RemotePos& r = g_remotes[freeSlot];
+        strncpy(r.name, name, sizeof(r.name) - 1);
+        r.x = x;
+        r.y = y;
+        r.z = z;
+        r.lastMs = GetTickCount();
+        r.active = 1;
+    }
+    LeaveCriticalSection(&g_remoteLock);
+}
+
+// Move every tracked remote character to its reported position. Names equal
+// to the local player's character are skipped so broadcast echoes from the
+// partner (who also simulates our character) never fight the local sim.
+void ApplyRemotePositions(const char* ownName) {
+    uintptr_t world = game::GetGameWorld(Discovery::Get());
+    if (!world) return;
+    RemoteEnsureLock();
+    EnterCriticalSection(&g_remoteLock);
+    const DWORD now = GetTickCount();
+    for (int i = 0; i < kMaxRemote; i++) {
+        if (!g_remotes[i].active) continue;
+        if (now - g_remotes[i].lastMs > 20000) continue;
+        if (ownName[0] && _stricmp(g_remotes[i].name, ownName) == 0) continue;
+        uintptr_t ch = 0;
+        if (game::FindCharacterByName(world, g_remotes[i].name, ch)) {
+            Vec3 p = { g_remotes[i].x, g_remotes[i].y, g_remotes[i].z };
+            if (game::WriteCharacterPosition(ch, p)) {
+                log::Info("session: moved remote '%s' to (%.0f %.0f %.0f)",
+                          g_remotes[i].name, p.x, p.y, p.z);
+            }
+        }
+    }
+    LeaveCriticalSection(&g_remoteLock);
+}
+
+void RemotePrune() {
+    RemoteEnsureLock();
+    EnterCriticalSection(&g_remoteLock);
+    const DWORD now = GetTickCount();
+    for (int i = 0; i < kMaxRemote; i++) {
+        if (g_remotes[i].active && now - g_remotes[i].lastMs > 60000) {
+            g_remotes[i].active = 0;
+            g_remotes[i].name[0] = '\0';
+        }
+    }
+    LeaveCriticalSection(&g_remoteLock);
+}
+
+// Refresh the cached view of the live character pool. Runs on a slow cadence:
+// the pool only changes on zone streaming / world loads, and the cache drives
+// per-char cooldowns so a refresh can never flood the network.
+void RefreshCharCache() {
+    uintptr_t world = game::GetGameWorld(Discovery::Get());
+    if (!world) return;
+    uintptr_t next[kMaxCache];
+    int n = game::ListCharacters(world, next, kMaxCache);
+    const DWORD now = GetTickCount();
+    for (int i = 0; i < n; i++) {
+        if (g_cache[i] != next[i]) {
+            g_cache[i] = next[i];
+            g_cacheSentMs[i] = now; // new char: wait before first send
+        }
+    }
+    for (int i = n; i < kMaxCache; i++) {
+        g_cache[i] = 0;
+        g_cacheSentMs[i] = 0;
+    }
+    g_cacheCount = n;
+    log::Info("session: world camera sees %d characters in this zone", n);
+}
+
+// Broadcast live positions for every cached world character, keyed by in-game
+// name. Both clients sim the same shared save, so the peer can find each char
+// by name and snap it into place. Throttled per-char and capped per tick so
+// NPC drift (below the 2-unit threshold) never saturates the relay.
+int BroadcastWorldPositions(net::Session* s) {
+    const DWORD now = GetTickCount();
+    int sent = 0;
+    for (int i = 0; i < g_cacheCount && sent < 16; i++) {
+        uintptr_t ch = g_cache[i];
+        if (!ch) continue;
+        if (now - g_cacheSentMs[i] < 800) continue;
+        Vec3 cur = {};
+        if (!game::GetCharacterPosition(ch, cur)) continue;
+        if (g_cacheSentMs[i] != 0 &&
+            std::fabsf(cur.x - g_cachePos[i].x) < 2.0f &&
+            std::fabsf(cur.y - g_cachePos[i].y) < 2.0f &&
+            std::fabsf(cur.z - g_cachePos[i].z) < 2.0f) {
+            continue;
+        }
+        char nm[96] = {};
+        if (!game::GetCharacterName(ch, nm, sizeof(nm))) continue;
+        char rp[200];
+        snprintf(rp, sizeof(rp), "RPOS %s %d %d %d\r\n",
+                 nm, (int)cur.x, (int)cur.y, (int)cur.z);
+        if (net::SessionSendLine(s, rp, 5000) == net::Result::Ok) {
+            g_cachePos[i] = cur;
+            g_cacheSentMs[i] = now;
+            sent++;
+        }
+    }
+    return sent;
+}
+
+// Parse an "ONLINE <n> <name> [<name> ...]" roster (count token skipped)
+// into the status globals.
+void HandleOnlineLine(const char* p) {
+    RemoteEnsureLock();
+    g_onlineCount = 0;
+    g_onlineNames[0] = '\0';
+    // Skip the count token ("ONLINE 3" -> names start after it).
+    while (*p && *p == ' ') p++;
+    while (*p && *p != ' ') p++;
+    size_t off = 0;
+    while (*p && g_onlineCount < 24 && off < sizeof(g_onlineNames) - 1) {
+        if (*p == ' ') { p++; continue; }
+        const char* e = p;
+        while (*e && *e != ' ') e++;
+        int len = (int)(e - p);
+        if (len > 0) {
+            int n = snprintf(g_onlineNames + off, sizeof(g_onlineNames) - off,
+                             "%s%.*s", g_onlineCount ? ", " : "", len, p);
+            if (n > 0) off += (size_t)n;
+            g_onlineCount++;
+        }
+        p = e;
+    }
+    log::Info("session: online roster (%d): %s", g_onlineCount, g_onlineNames);
+}
 
 void EnsureLockInit() {
     if (g_lockInit) return;
@@ -63,9 +248,14 @@ void TriggerQuicksave() {
     log::Info("session: quicksave key injected (SendInput=%u)", sent);
 }
 
-// ---- server-side save blob transfer -----------------------------------------
+// ---- server-side shared world blob transfer ---------------------------------
 
 const size_t kBlobChunk = 256 * 1024;
+
+// All clients upload/download through this single key: the server world blob.
+// Login stays per-account, but the WORLD is shared so every client loads the
+// same authority save and co-op partners are guaranteed to coexist in it.
+const char* kSharedBlob = "shared";
 
 // SAVE_DOWNLOAD_BEGIN .. SAVE_DOWNLOAD .. SAVE_DOWNLOAD_END. Returns a malloc'd
 // blob (exactly `size` bytes) or nullptr.
@@ -212,7 +402,7 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
     net::SessionDrain(s, 5000); // consume greeting
 
     char infoCmd[256];
-    snprintf(infoCmd, sizeof(infoCmd), "SAVE_INFO %s\r\n", userName);
+    snprintf(infoCmd, sizeof(infoCmd), "SAVE_INFO %s\r\n", kSharedBlob);
     net::Reply info = net::SessionRequest(s, infoCmd, 8000);
 
     long long saveSize = 0;
@@ -232,7 +422,7 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
 
     int reqId = 0;
     if (haveSave) {
-        unsigned char* blob = DownloadBlob(s, userName, saveSize);
+        unsigned char* blob = DownloadBlob(s, kSharedBlob, saveSize);
         if (!blob) {
             SetStatus("Could not download your world save.");
             net::SessionStop(s);
@@ -263,7 +453,7 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
             size_t blobLen = 0;
             unsigned char* blob = savesync::PackSaveFolder(slot, &blobLen);
             if (blob && blobLen > 0) {
-                if (UploadBlob(s, userName, blob, blobLen)) {
+                if (UploadBlob(s, kSharedBlob, blob, blobLen)) {
                     log::Info("session: adopted local save '%s' (%zu bytes)",
                               slot, blobLen);
                     reqId = savemgr::RequestLoad(slot);
@@ -304,6 +494,10 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
     bool live = false;
     bool spawnApplied = false;
     unsigned long polls = 0;
+    Vec3 lastSentPos = {};
+    bool posSeeded = false;
+    int periodic = 0;
+    int nextRefresh = 30;
 
     // Force the game to run at exactly x1 forever (server-synced world).
     speedlock::Begin();
@@ -348,12 +542,6 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
             continue;
         }
         if (line.result == net::Result::Ok && strcmp(line.line, "QUICKSAVE") == 0) {
-            // Filesystem-driven liveness: a quicksave only materialises when a
-            // world with a committed character is active (the engine writes a
-            // quick.save into a slot). At the main menu / during character
-            // creation nothing is written, so we skip without ever touching
-            // uncommitted state. The connection itself stays open throughout.
-            log::Info("session: server asked for quicksave");
             TriggerQuicksave();
             Sleep(3000); // let the engine finish writing the folder
 
@@ -362,7 +550,7 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
                 size_t blobLen = 0;
                 unsigned char* blob = savesync::PackSaveFolder(folder, &blobLen);
                 if (blob && blobLen > 0) {
-                    bool uploaded = UploadBlob(s, userName, blob, blobLen);
+                    bool uploaded = UploadBlob(s, kSharedBlob, blob, blobLen);
                     free(blob);
                     if (uploaded) {
                         log::Info("session: uploaded live save slot '%s' (%zu bytes)",
@@ -394,6 +582,25 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
             } else {
                 log::Info("session: no live save slot to upload (menu/creation); skipped");
             }
+            continue;
+        }
+        if (line.result == net::Result::Ok && strncmp(line.line, "POS ", 4) == 0) {
+            // Position relay: "<user> x y z" tracking a remote player.
+            float px = 0, py = 0, pz = 0;
+            char rn[128] = {};
+            if (sscanf(line.line + 4, "%127s %f %f %f", rn, &px, &py, &pz) >= 4) {
+                RemoteSet(rn, px, py, pz);
+                log::Info("session: remote '%s' @ (%.0f %.0f %.0f)", rn, px, py, pz);
+            }
+            continue;
+        }
+        if (line.result == net::Result::Ok && strncmp(line.line, "CLOCK ", 6) == 0) {
+            g_clockSec = (DWORD)atol(line.line + 6);
+            log::Info("session: world clock now %lu", (unsigned long)g_clockSec);
+            continue;
+        }
+        if (line.result == net::Result::Ok && strncmp(line.line, "ONLINE ", 7) == 0) {
+            HandleOnlineLine(line.line + 7);
             continue;
         }
         if (line.result == net::Result::Ok) {
@@ -483,6 +690,52 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
             } else {
                 SetStatus("Server rejected load (%s).", ent.line);
                 log::Warn("session: server load failed: %s", ent.line);
+            }
+            continue;
+        }
+
+        // Periodic world sync on the ~1s poll cadence: checkpoint our own
+        // position, broadcast the whole visible world to the relay, snap
+        // remote characters into place, refresh roster and clock.
+        periodic++;
+        if (live) {
+            Vec3 cur = {};
+            if (game::GetCharacterPosition(charPtr, cur)) {
+                if (!posSeeded ||
+                    std::fabsf(cur.x - lastSentPos.x) > 4.0f ||
+                    std::fabsf(cur.y - lastSentPos.y) > 4.0f) {
+                    lastSentPos = cur;
+                    posSeeded = true;
+                    char spCmd[256];
+                    snprintf(spCmd, sizeof(spCmd), "SAVE_POS %s %d %d %d\r\n",
+                             userName, (int)cur.x, (int)cur.y, (int)cur.z);
+                    net::Reply rp = net::SessionRequest(s, spCmd, 5000);
+                    if (rp.result == net::Result::Ok &&
+                        strncmp(rp.line, "OK SAVED", 8) == 0) {
+                        log::Info("session: checkpointed own spawn (%.0f %.0f %.0f)",
+                                  cur.x, cur.y, cur.z);
+                    }
+                }
+            }
+            if (periodic % 30 == 1) RefreshCharCache();
+            BroadcastWorldPositions(s);
+            ApplyRemotePositions(charName);
+            RemotePrune();
+            if (++nextRefresh >= 30) {
+                nextRefresh = 0;
+                net::Reply w = net::SessionRequest(s, "WHO\r\n", 5000);
+                if (w.result == net::Result::Ok) {
+                    char* at = strstr(w.line, "ONLINE ");
+                    if (at) HandleOnlineLine(at + 7);
+                }
+                net::Reply t = net::SessionRequest(s, "TIME?\r\n", 5000);
+                if (t.result == net::Result::Ok && strncmp(t.line, "OK CLOCK", 8) == 0) {
+                    DWORD c = (DWORD)atol(t.line + 9);
+                    if (c != g_clockSec) {
+                        g_clockSec = c;
+                        log::Info("session: clock query -> %lu", (unsigned long)c);
+                    }
+                }
             }
             continue;
         }

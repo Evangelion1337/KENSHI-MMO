@@ -2,8 +2,10 @@
 
 A LAN/Internet multiplayer mod for Kenshi (Lo-Fi Games). Consists of a client plugin
 (`KenshiMMO.dll`) injected alongside the vanilla game, and a standalone server
-(`KenshiMMO.Server.exe`). The server is authoritative: account logins, world
-synchronization, and per-account save blobs all live server-side.
+(`KenshiMMO.Server.exe`). The server is authoritative: account logins and the shared
+world all live server-side. A single **world blob** (`saves/shared/save.blob`) is the
+authority world that every client downloads; in-game characters are broadcast live
+(`RPOS`) so co-op partners see each other move.
 
 Requires a **licensed** copy of Kenshi. Distributed without game assets; nothing
 from the retail install is included in this repository.
@@ -15,7 +17,7 @@ Makefile                 Builds both targets (mingw cross-compile)
 run_kenshi.sh            Linux launcher example for the client
 src/                     Client plugin sources (dll)
 server/                  Server sources (exe)
-KenshiMMO.dll            Prebuilt client plugin  (md5 e6fff526d050ec3e4eee6744aca5ce9f)
+KenshiMMO.dll            Prebuilt client plugin  (md5 070f5aaee94fa89fdf3f9c35d687eabb)
 KenshiMMO.Server.exe     Prebuilt server
 KenshiMMO.mod            Kenshi data mod (co-op Wanderer/Multiplayer starts, template clones)
 RE_Kenshi.json           Plugin-loader config -> registers "KenshiMMO.dll" with RE_Kenshi
@@ -99,4 +101,8 @@ Run via `./run_kenshi.sh`.
 
 - Server is the single source of truth; the client never uses local saves after
   first upload.
-- Protocol `OK KenshiMMO server v0.1. Type REGISTER <user> <pass> or LOGIN <user> <pass>`.
+- The shared world blob is `saves/shared/save.blob`. On first boot with no blob the
+  server seeds it from the largest legacy per-account blob so an existing world
+  becomes the authority world.
+- Protocol `OK KenshiMMO server v0.2 (shared world). Type REGISTER <user> <pass> or
+  LOGIN <user> <pass>`.
