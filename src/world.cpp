@@ -369,5 +369,53 @@ bool WriteCharacterPosition(uintptr_t charPtr, const Vec3& pos) {
     return wroteCached || wroteChain;
 }
 
+// Kenshi-Online CE-verified health chain (v1.0.68): character+0x2B8 ->
+// +0x5F8 -> +0x40 + stride*part. Body parts: Head=0, Chest=1, ... stride 8
+// (health float + stun float per part). All reads/writes are guarded.
+const int kHealthChain1 = 0x2B8;
+const int kHealthChain2 = 0x5F8;
+const int kHealthBase = 0x40;
+const int kHealthStride = 8;
+const int kHeadPart = 0;
+const int kChestPart = 1;
+
+uintptr_t HealthBlock(uintptr_t charPtr) {
+    if (!charPtr) return 0;
+    uintptr_t p1 = 0;
+    if (!mem::Read(charPtr + kHealthChain1, p1) || !p1) return 0;
+    uintptr_t p2 = 0;
+    if (!mem::Read(p1 + kHealthChain2, p2) || !p2) return 0;
+    return p2;
+}
+
+bool GetCharacterHealth(uintptr_t charPtr, int part, float& out) {
+    if (part < 0 || part > 6) return false;
+    uintptr_t hp = HealthBlock(charPtr);
+    if (!hp) return false;
+    return mem::Read(hp + kHealthBase + part * kHealthStride, out);
+}
+
+bool WriteCharacterHealth(uintptr_t charPtr, int part, float value) {
+    if (part < 0 || part > 6) return false;
+    uintptr_t hp = HealthBlock(charPtr);
+    if (!hp) return false;
+    float cur = 0;
+    if (!mem::Read(hp + kHealthBase + part * kHealthStride, cur)) return false;
+    if (cur <= value) return true; // already as bad or worse: leave it alone
+    return mem::Write(hp + kHealthBase + part * kHealthStride, &value, 4);
+}
+
+// Combat state of a character (0=alive, 1=down/KO, 2=dead) using the
+// Kenshi-Online IsAlive fallback: death when head or chest <= -100. A char
+// reading <= 0 on head or chest is treated as down but not dead.
+int CharacterCombatState(uintptr_t charPtr) {
+    float head = 0, chest = 0;
+    GetCharacterHealth(charPtr, kHeadPart, head);
+    GetCharacterHealth(charPtr, kChestPart, chest);
+    if (head <= -100.f || chest <= -100.f) return 2;
+    if (head <= 0.f || chest <= 0.f) return 1;
+    return 0;
+}
+
 } // namespace game
 } // namespace kmmo

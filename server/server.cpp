@@ -128,6 +128,22 @@ void BroadcastClock() {
     LeaveCriticalSection(&g_connLock);
 }
 
+// Relay a one-shot event line (e.g. a combat state change) to every other
+// logged-in session, skipping the sender. No persistence, no reply: mirrors
+// the live RPOS relay but for discrete state transitions.
+void RelayEvent(const char* line, SOCKET src) {
+    EnterCriticalSection(&g_connLock);
+    for (int c = 0; c < kMaxOnline; c++) {
+        if (g_conns[c].active && g_conns[c].user[0] != '\0') {
+            if (g_conns[c].s == src) continue;
+            if (send(g_conns[c].s, line, (int)strlen(line), 0) <= 0) {
+                g_conns[c].active = 0;
+            }
+        }
+    }
+    LeaveCriticalSection(&g_connLock);
+}
+
 DWORD WINAPI RelayLoop(LPVOID) {
     for (;;) {
         Sleep(1000);
@@ -333,7 +349,7 @@ DWORD WINAPI ClientWorker(LPVOID param) {
 
     bool loggedIn = false;
     (void)loggedIn;
-    SendResponse(s, "OK", "KenshiMMO server v0.2 (shared world). Type REGISTER <user> <pass> or LOGIN <user> <pass>");
+    SendResponse(s, "OK", "KenshiMMO server v0.3 (shared world + combat). Type REGISTER <user> <pass> or LOGIN <user> <pass>");
 
     while (RecvLine(s, buf, sizeof(buf)) >= 0) {
         if (strlen(buf) == 0) continue;
@@ -450,6 +466,19 @@ DWORD WINAPI ClientWorker(LPVOID param) {
             // per-account checkpoint is SAVE_POS. No reply on purpose.
             if (loggedIn) {
                 PosStore(toks[1], atoi(toks[2]), atoi(toks[3]), atoi(toks[4]), s);
+            }
+        } else if (_stricmp(toks[0], "CEVT") == 0 && n >= 3) {
+            // Combat event relay: "<character> <state>" (1=down, 2=dead).
+            // One-shot: relayed to all other sessions, sender skipped, not
+            // stored or acknowledged, mirroring RPOS.
+            if (loggedIn) {
+                int cst = atoi(toks[2]);
+                if (cst >= 1 && cst <= 2) {
+                    char evLine[256];
+                    snprintf(evLine, sizeof(evLine), "CEVT %s %d\r\n", toks[1], cst);
+                    kmmo::srvlog::Info("combat event %s -> %d", toks[1], cst);
+                    RelayEvent(evLine, s);
+                }
             }
         } else if (_stricmp(toks[0], "SAVE_UPLOAD_BEGIN") == 0 && n >= 2) {
             // World blob upload open: resets the shared authority world blob.

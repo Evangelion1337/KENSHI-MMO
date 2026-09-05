@@ -54,7 +54,49 @@ const int kMaxCache = 1024;
 uintptr_t g_cache[kMaxCache];
 Vec3 g_cachePos[kMaxCache];
 DWORD g_cacheSentMs[kMaxCache];
+int g_cacheState[kMaxCache];   // last observed combat state per cache slot
+int g_cacheInit[kMaxCache];    // 1 once a state baseline has been observed
 int g_cacheCount = 0;
+
+// Echo guards: when a remote CEVT is APPLIED locally, the local sim's next
+// state transition for that same character must not be re-broadcast (that
+// would echo the event back to the same player). Guards match name+state and
+// are consumed by the detector on the next tick.
+const int kMaxGuards = 32;
+struct Guard {
+    char name[96];
+    int state;
+    DWORD ms;
+};
+Guard g_guard[kMaxGuards];
+int g_guardCount = 0;
+
+void GuardAdd(const char* name, int state) {
+    if (g_guardCount < kMaxGuards) {
+        strncpy(g_guard[g_guardCount].name, name, sizeof(g_guard[g_guardCount].name) - 1);
+        g_guard[g_guardCount].name[sizeof(g_guard[g_guardCount].name) - 1] = '\0';
+        g_guard[g_guardCount].state = state;
+        g_guard[g_guardCount].ms = GetTickCount();
+        g_guardCount++;
+    }
+}
+
+bool GuardMatchAndConsume(const char* name, int state) {
+    const DWORD now = GetTickCount();
+    int keep = 0;
+    bool matched = false;
+    for (int i = 0; i < g_guardCount; i++) {
+        if (now - g_guard[i].ms > 30000) continue; // stale: drop silently
+        if (!matched && g_guard[i].state == state &&
+            _stricmp(g_guard[i].name, name) == 0) {
+            matched = true;
+            continue;
+        }
+        g_guard[keep++] = g_guard[i];
+    }
+    g_guardCount = keep;
+    return matched;
+}
 
 // Latest server time-of-day (seconds) and online roster for the status line.
 volatile DWORD g_clockSec = 0;
@@ -148,11 +190,15 @@ void RefreshCharCache() {
         if (g_cache[i] != next[i]) {
             g_cache[i] = next[i];
             g_cacheSentMs[i] = now; // new char: wait before first send
+            g_cacheState[i] = -1;   // re-baseline combat state
+            g_cacheInit[i] = 0;
         }
     }
     for (int i = n; i < kMaxCache; i++) {
         g_cache[i] = 0;
         g_cacheSentMs[i] = 0;
+        g_cacheState[i] = -1;
+        g_cacheInit[i] = 0;
     }
     g_cacheCount = n;
     log::Info("session: world camera sees %d characters in this zone", n);
@@ -171,14 +217,34 @@ int BroadcastWorldPositions(net::Session* s) {
         if (now - g_cacheSentMs[i] < 800) continue;
         Vec3 cur = {};
         if (!game::GetCharacterPosition(ch, cur)) continue;
+        char nm[96] = {};
+        if (!game::GetCharacterName(ch, nm, sizeof(nm))) continue;
+
+        // Combat state transitions (0=alive, 1=down, 2=dead). Broadcast once
+        // per regression so co-op partners see KO/death land simultaneously.
+        // Deliberately independent of the movement threshold below: a fighter
+        // that stops moving must still report its KO. Echo guards suppress
+        // re-emission right after a remote apply.
+        int st = game::CharacterCombatState(ch);
+        if (g_cacheInit[i] && st > g_cacheState[i] &&
+            !GuardMatchAndConsume(nm, st)) {
+            char ev[128];
+            snprintf(ev, sizeof(ev), "CEVT %s %d\r\n", nm, st);
+            if (net::SessionSendLine(s, ev, 5000) == net::Result::Ok) {
+                log::Info("session: combat event '%s' -> state %d", nm, st);
+                g_cacheState[i] = st;
+            }
+        } else if (!g_cacheInit[i]) {
+            g_cacheState[i] = st;
+            g_cacheInit[i] = 1;
+        }
+
         if (g_cacheSentMs[i] != 0 &&
             std::fabsf(cur.x - g_cachePos[i].x) < 2.0f &&
             std::fabsf(cur.y - g_cachePos[i].y) < 2.0f &&
             std::fabsf(cur.z - g_cachePos[i].z) < 2.0f) {
             continue;
         }
-        char nm[96] = {};
-        if (!game::GetCharacterName(ch, nm, sizeof(nm))) continue;
         char rp[200];
         snprintf(rp, sizeof(rp), "RPOS %s %d %d %d\r\n",
                  nm, (int)cur.x, (int)cur.y, (int)cur.z);
@@ -591,6 +657,30 @@ DWORD WINAPI EnterWorldWorker(LPVOID param) {
             if (sscanf(line.line + 4, "%127s %f %f %f", rn, &px, &py, &pz) >= 4) {
                 RemoteSet(rn, px, py, pz);
                 log::Info("session: remote '%s' @ (%.0f %.0f %.0f)", rn, px, py, pz);
+            }
+            continue;
+        }
+        if (line.result == net::Result::Ok && strncmp(line.line, "CEVT ", 5) == 0) {
+            // Combat event relay: "<character> <state>" (1=down, 2=dead).
+            // Party that simulates the same world; force the local copy of
+            // that character into the reported state so KO/death land on
+            // both seats at the same time.
+            char cn[128] = {};
+            int cst = 0;
+            if (sscanf(line.line + 5, "%127s %d", cn, &cst) >= 2 && (cst == 1 || cst == 2)) {
+                uintptr_t world = game::GetGameWorld(Discovery::Get());
+                uintptr_t ch = 0;
+                if (world && game::FindCharacterByName(world, cn, ch)) {
+                    GuardAdd(cn, cst); // suppress our own re-broadcast
+                    float target = (cst == 2) ? -100.0f : 0.0f;
+                    bool wrote = game::WriteCharacterHealth(ch, 0, target) |
+                                 game::WriteCharacterHealth(ch, 1, target);
+                    log::Info("session: remote combat '%s' -> state %d (wrote=%d)",
+                              cn, cst, wrote ? 1 : 0);
+                } else {
+                    log::Info("session: remote combat '%s' but no such local character",
+                              cn);
+                }
             }
             continue;
         }

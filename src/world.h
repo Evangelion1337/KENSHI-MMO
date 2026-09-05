@@ -52,5 +52,17 @@ int CountCharacters(uintptr_t world);
 // load the same save, so every character exists on both sides).
 int ListCharacters(uintptr_t world, uintptr_t* out, int cap);
 
+// Read a single body-part health float via the Kenshi-Online CE-verified
+// chain (char+0x2B8 -> +0x5F8 -> +0x40 + stride*part), Head=0/Chest=1.
+// Guarded reads; returns false if the chain isn't readable yet.
+bool GetCharacterHealth(uintptr_t charPtr, int part, float& out);
+
+// Force a body part's health downward to `value` (only if currently higher).
+// Used to apply remote combat events (KO/death) without calling game code.
+bool WriteCharacterHealth(uintptr_t charPtr, int part, float value);
+
+// Coarse combat state: 0=alive, 1=down/KO, 2=dead (head/chest <= -100).
+int CharacterCombatState(uintptr_t charPtr);
+
 } // namespace game
 } // namespace kmmo
